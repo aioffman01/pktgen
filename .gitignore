@@ -1,0 +1,9 @@
+# Compile binary
+pktgen
+
+# Temp logs
+tcpdump_test.log
+*.log
+
+# Dynamic log directories (e.g. 20260714-002844)
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]/
