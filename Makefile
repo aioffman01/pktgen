@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -g
+CFLAGS = -Wall -Wextra -O3 -g -pthread
 TARGET = pktgen
 SRCS = pktgen.c
 
