@@ -43,10 +43,10 @@ tcpdump -i "$IFACE" -nn -A "tcp port 80 or tcp port 8080 or tcp port 3306" -c 15
 TCPDUMP_PID=$!
 
 # 조금 대기 후 패킷 생성기 백그라운드 시작
-# 시뮬레이션: Users 100, Webs 5, WAS 2, DB 1, 초당 1000 패킷 전송, 1분 실행 제한 설정
+# 시뮬레이션: pktgen.cfg 설정 파일을 이용해 구동, 초당 1000 패킷 전송, 1분 실행 제한 설정
 sleep 1
 echo "pktgen 실행 중..."
-./pktgen -i "$IFACE" --users 100 --webs 5 --was 2 --dbs 1 -r 1000 -t 1 > /dev/null 2>&1 &
+./pktgen -i "$IFACE" -c pktgen.cfg -r 1000 -t 1 > /dev/null 2>&1 &
 PKTGEN_PID=$!
 
 # 5초간 패킷 주입 진행

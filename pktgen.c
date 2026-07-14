@@ -1,6 +1,8 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -33,6 +35,9 @@
 
 #define LOG_FILE_NAME "pktgen_summary.log"
 
+// Batch size for sendmmsg
+#define BATCH_SIZE 64
+
 // Signal flag to control the loop execution
 volatile int keep_running = 1;
 
@@ -40,6 +45,17 @@ volatile int keep_running = 1;
 void handle_sigint(int sig) {
     (void)sig;
     keep_running = 0;
+}
+
+// Trim spaces from string
+char *trim_space(char *str) {
+    char *end;
+    while (isspace((unsigned char)*str)) str++;
+    if (*str == 0) return str;
+    end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+    return str;
 }
 
 // TCP Pseudo Header for Checksum
@@ -201,6 +217,98 @@ void write_ip_log(const char *filename, uint32_t ip_users, int num_users,
     printf("IP allocation map successfully logged to '%s'\n", filename);
 }
 
+// INI Config Parser
+int parse_config(const char *filename, 
+                 uint32_t *ip_users, int *num_users,
+                 uint32_t *ip_webs, int *num_webs,
+                 uint32_t *ip_was, int *num_was,
+                 uint32_t *ip_dbs, int *num_dbs,
+                 double *min_kb, double *max_kb) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        perror("Failed to open config file");
+        return -1;
+    }
+
+    char line[256];
+    char current_section[64] = {0};
+
+    while (fgets(line, sizeof(line), file)) {
+        char *trimmed = trim_space(line);
+        
+        // Skip comments and empty lines
+        if (trimmed[0] == ';' || trimmed[0] == '#' || trimmed[0] == '\0') {
+            continue;
+        }
+
+        // Section header
+        if (trimmed[0] == '[' && trimmed[strlen(trimmed) - 1] == ']') {
+            strncpy(current_section, trimmed + 1, strlen(trimmed) - 2);
+            current_section[strlen(trimmed) - 2] = '\0';
+            continue;
+        }
+
+        // Key-Value pair
+        char *eq = strchr(trimmed, '=');
+        if (eq) {
+            *eq = '\0';
+            char *key = trim_space(trimmed);
+            char *val = trim_space(eq + 1);
+
+            if (strcmp(current_section, "user") == 0) {
+                if (strcmp(key, "ip") == 0) {
+                    char ip_str[64];
+                    int mask;
+                    if (sscanf(val, "%[^/]/%d", ip_str, &mask) >= 1) {
+                        *ip_users = inet_addr(ip_str);
+                    }
+                } else if (strcmp(key, "count") == 0) {
+                    *num_users = atoi(val);
+                }
+            } else if (strcmp(current_section, "web") == 0) {
+                if (strcmp(key, "ip") == 0) {
+                    char ip_str[64];
+                    int mask;
+                    if (sscanf(val, "%[^/]/%d", ip_str, &mask) >= 1) {
+                        *ip_webs = inet_addr(ip_str);
+                    }
+                } else if (strcmp(key, "count") == 0) {
+                    *num_webs = atoi(val);
+                }
+            } else if (strcmp(current_section, "was") == 0) {
+                if (strcmp(key, "ip") == 0) {
+                    char ip_str[64];
+                    int mask;
+                    if (sscanf(val, "%[^/]/%d", ip_str, &mask) >= 1) {
+                        *ip_was = inet_addr(ip_str);
+                    }
+                } else if (strcmp(key, "count") == 0) {
+                    *num_was = atoi(val);
+                }
+            } else if (strcmp(current_section, "db") == 0) {
+                if (strcmp(key, "ip") == 0) {
+                    char ip_str[64];
+                    int mask;
+                    if (sscanf(val, "%[^/]/%d", ip_str, &mask) >= 1) {
+                        *ip_dbs = inet_addr(ip_str);
+                    }
+                } else if (strcmp(key, "count") == 0) {
+                    *num_dbs = atoi(val);
+                }
+            } else if (strcmp(current_section, "data") == 0) {
+                if (strcmp(key, "min_kb") == 0) {
+                    *min_kb = atof(val);
+                } else if (strcmp(key, "max_kb") == 0) {
+                    *max_kb = atof(val);
+                }
+            }
+        }
+    }
+
+    fclose(file);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     // Register signal handler for Ctrl+C
     signal(SIGINT, handle_sigint);
@@ -215,6 +323,8 @@ int main(int argc, char *argv[]) {
     }
 
     char *if_name = NULL;
+    char *config_file = NULL;
+
     int num_users = DEFAULT_USERS;
     int num_webs = DEFAULT_WEBS;
     int num_was = DEFAULT_WAS;
@@ -227,6 +337,8 @@ int main(int argc, char *argv[]) {
 
     int target_pps = 0; // 0 means maximum speed
     int duration_min = 0; // 0 means infinite
+    double min_kb = 0.0;
+    double max_kb = 0.0;
 
     struct option long_options[] = {
         {"interface", required_argument, 0, 'i'},
@@ -240,12 +352,15 @@ int main(int argc, char *argv[]) {
         {"db-ip", required_argument, 0, 1003},
         {"pps", required_argument, 0, 'r'},
         {"duration", required_argument, 0, 't'},
+        {"config", required_argument, 0, 'c'},
+        {"min-size", required_argument, 0, 1004},
+        {"max-size", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:u:w:a:d:r:t:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:u:w:a:d:r:t:c:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': if_name = strdup(optarg); break;
             case 'u': num_users = atoi(optarg); break;
@@ -258,11 +373,15 @@ int main(int argc, char *argv[]) {
             case 1003: ip_dbs = inet_addr(optarg); break;
             case 'r': target_pps = atoi(optarg); break;
             case 't': duration_min = atoi(optarg); break;
+            case 'c': config_file = strdup(optarg); break;
+            case 1004: min_kb = atof(optarg); break;
+            case 1005: max_kb = atof(optarg); break;
             case 'h':
             default:
                 printf("Usage: %s -i <interface> [options]\n", argv[0]);
                 printf("Options:\n");
                 printf("  -i, --interface  Network interface to inject packets (e.g., eth0)\n");
+                printf("  -c, --config     Path to config.cfg file\n");
                 printf("  -u, --users      Number of simulated users (default: %d)\n", DEFAULT_USERS);
                 printf("  -w, --webs       Number of simulated Web servers (default: %d)\n", DEFAULT_WEBS);
                 printf("  -a, --was        Number of simulated WAS servers (default: %d)\n", DEFAULT_WAS);
@@ -271,6 +390,8 @@ int main(int argc, char *argv[]) {
                 printf("  --web-ip         Base IP of Web servers (default: %s)\n", DEFAULT_WEB_IP);
                 printf("  --was-ip         Base IP of WAS servers (default: %s)\n", DEFAULT_WAS_IP);
                 printf("  --db-ip          Base IP of DB servers (default: %s)\n", DEFAULT_DB_IP);
+                printf("  --min-size       Minimum packet size in KB\n");
+                printf("  --max-size       Maximum packet size in KB\n");
                 printf("  -r, --pps        Target Packets Per Second (default: max)\n");
                 printf("  -t, --duration   Execution duration in minutes (default: infinite)\n");
                 return 1;
@@ -282,10 +403,31 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Load config from file if provided
+    if (config_file) {
+        printf("Loading configuration file: %s\n", config_file);
+        if (parse_config(config_file, &ip_users, &num_users, &ip_webs, &num_webs, &ip_was, &num_was, &ip_dbs, &num_dbs, &min_kb, &max_kb) == 0) {
+            printf("Configuration successfully loaded from file.\n");
+        } else {
+            fprintf(stderr, "Warning: Failed to load config from file, using command line / defaults.\n");
+        }
+    }
+
+    // Safety checks on packet payload size limits (Cap at 10000.0 KB)
+    if (min_kb > 10000.0) {
+        printf("Warning: min-size (%.2f KB) exceeds 10000 KB limit. Capping to 10000 KB.\n", min_kb);
+        min_kb = 10000.0;
+    }
+    if (max_kb > 10000.0) {
+        printf("Warning: max-size (%.2f KB) exceeds 10000 KB limit. Capping to 10000 KB.\n", max_kb);
+        max_kb = 10000.0;
+    }
+
     // Set up socket
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
         perror("Socket creation failed (Must run as root/sudo)");
+        if (config_file) free(config_file);
         return 1;
     }
 
@@ -296,6 +438,7 @@ int main(int argc, char *argv[]) {
     if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
         perror("Failed to get interface index");
         close(sock);
+        if (config_file) free(config_file);
         return 1;
     }
     int if_index = ifr.ifr_ifindex;
@@ -309,18 +452,33 @@ int main(int argc, char *argv[]) {
 
     printf("Starting Packet Generator on interface: %s\n", if_name);
     printf("Simulation counts: Users=%d, Web=%d, WAS=%d, DB=%d\n", num_users, num_webs, num_was, num_dbs);
+    if (min_kb > 0.0 && max_kb >= min_kb) {
+        printf("Data (Payload) Size Limits: %.2f KB ~ %.2f KB (Randomized & Padded)\n", min_kb, max_kb);
+    } else {
+        printf("Data (Payload) Size Limits: Template size (No Padding)\n");
+    }
+    
     if (duration_min > 0) {
         printf("Execution time limit: %d minutes\n", duration_min);
     } else {
         printf("Execution time limit: infinite (Press Ctrl+C to stop)\n");
     }
 
-    // Packet buffers
-    char pkt_buf[2048];
-    struct ethhdr *eth = (struct ethhdr *)pkt_buf;
-    struct iphdr *iph = (struct iphdr *)(pkt_buf + sizeof(struct ethhdr));
-    struct tcphdr *tcph = (struct tcphdr *)(pkt_buf + sizeof(struct ethhdr) + sizeof(struct iphdr));
-    char *payload_ptr = pkt_buf + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
+    // sendmmsg batch variables
+    struct mmsghdr msgs[BATCH_SIZE];
+    struct iovec iovecs[BATCH_SIZE];
+    char packet_buffers[BATCH_SIZE][2048]; // Multidimensional array for MTU-sized packets
+    int batch_idx = 0;
+
+    // Pre-initialize msgs structures
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < BATCH_SIZE; i++) {
+        iovecs[i].iov_base = packet_buffers[i];
+        msgs[i].msg_hdr.msg_name = &saddr;
+        msgs[i].msg_hdr.msg_namelen = sizeof(saddr);
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
 
     uint64_t total_sent = 0;
     uint64_t total_bytes = 0;
@@ -336,6 +494,9 @@ int main(int argc, char *argv[]) {
         sleep_time.tv_sec = ns_delay / 1000000000ULL;
         sleep_time.tv_nsec = ns_delay % 1000000000ULL;
     }
+
+    // Initialize random seed
+    srand(time(NULL));
 
     // Main injection loop
     int step = 0;
@@ -369,107 +530,182 @@ int main(int argc, char *argv[]) {
         uint16_t port_was_to_db = 49152 + (rand() % 16383);
 
         const char *payload = NULL;
-        int payload_len = 0;
+        int base_payload_len = 0;
         int current_flow = step % 6;
 
         switch (current_flow) {
             case 0: // User -> Web HTTP Request
-                memcpy(eth->h_source, mac_u, 6);
-                memcpy(eth->h_dest, mac_w, 6);
-                iph->saddr = ip_u;
-                iph->daddr = ip_w;
-                tcph->source = htons(port_u);
-                tcph->dest = htons(PORT_HTTP);
                 payload = PAYLOAD_USER_HTTP_REQ;
                 break;
             case 1: // Web -> User HTTP Response
-                memcpy(eth->h_source, mac_w, 6);
-                memcpy(eth->h_dest, mac_u, 6);
-                iph->saddr = ip_w;
-                iph->daddr = ip_u;
-                tcph->source = htons(PORT_HTTP);
-                tcph->dest = htons(port_u);
                 payload = PAYLOAD_WEB_HTTP_RES;
                 break;
             case 2: // Web -> WAS API Request
-                memcpy(eth->h_source, mac_w, 6);
-                memcpy(eth->h_dest, mac_a, 6);
-                iph->saddr = ip_w;
-                iph->daddr = ip_a;
-                tcph->source = htons(port_w_to_was);
-                tcph->dest = htons(PORT_WAS);
                 payload = PAYLOAD_WEB_WAS_REQ;
                 break;
             case 3: // WAS -> Web API Response
-                memcpy(eth->h_source, mac_a, 6);
-                memcpy(eth->h_dest, mac_w, 6);
-                iph->saddr = ip_a;
-                iph->daddr = ip_w;
-                tcph->source = htons(PORT_WAS);
-                tcph->dest = htons(port_w_to_was);
                 payload = PAYLOAD_WAS_WEB_RES;
                 break;
             case 4: // WAS -> DB SQL Query
-                memcpy(eth->h_source, mac_a, 6);
-                memcpy(eth->h_dest, mac_d, 6);
-                iph->saddr = ip_a;
-                iph->daddr = ip_d;
-                tcph->source = htons(port_was_to_db);
-                tcph->dest = htons(PORT_DB);
                 payload = PAYLOAD_WAS_DB_REQ;
                 break;
             case 5: // DB -> WAS SQL Response
-                memcpy(eth->h_source, mac_d, 6);
-                memcpy(eth->h_dest, mac_a, 6);
-                iph->saddr = ip_d;
-                iph->daddr = ip_a;
-                tcph->source = htons(PORT_DB);
-                tcph->dest = htons(port_was_to_db);
                 payload = PAYLOAD_DB_WAS_RES;
                 break;
         }
 
-        payload_len = strlen(payload);
-        memcpy(payload_ptr, payload, payload_len);
+        base_payload_len = strlen(payload);
 
-        eth->h_proto = htons(ETH_P_IP);
-
-        iph->version = 4;
-        iph->ihl = 5;
-        iph->tos = 0;
-        iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + payload_len);
-        iph->id = htons(rand() % 65535);
-        iph->frag_off = 0;
-        iph->ttl = 64;
-        iph->protocol = IPPROTO_TCP;
-        iph->check = 0;
-        iph->check = calculate_checksum((unsigned short *)iph, sizeof(struct iphdr));
-
-        tcph->seq = htonl(rand() % 1000000);
-        tcph->ack_seq = htonl(rand() % 1000000);
-        tcph->doff = 5;
-        tcph->fin = 0;
-        tcph->syn = 0;
-        tcph->rst = 0;
-        tcph->psh = 1;
-        tcph->ack = 1;
-        tcph->urg = 0;
-        tcph->window = htons(14600);
-        tcph->check = 0;
-        tcph->urg_ptr = 0;
-
-        tcph->check = compute_tcp_checksum(iph, tcph, payload, payload_len);
-
-        int packet_size = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + payload_len;
-        
-        if (sendto(sock, pkt_buf, packet_size, 0, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
-            perror("Packet injection failed");
-            close(sock);
-            return 1;
+        // Custom data (payload) sizing & padding logic
+        int target_payload_len = base_payload_len;
+        if (min_kb > 0.0 && max_kb >= min_kb) {
+            int min_bytes = (int)(min_kb * 1024.0);
+            int max_bytes = (int)(max_kb * 1024.0);
+            if (max_bytes > min_bytes) {
+                target_payload_len = min_bytes + (rand() % (max_bytes - min_bytes + 1));
+            } else {
+                target_payload_len = min_bytes;
+            }
         }
 
-        total_sent++;
-        total_bytes += packet_size;
+        // Limit maximum size to 10000 KB (10,240,000 bytes)
+        int max_allowed_bytes = 10000 * 1024;
+        if (target_payload_len > max_allowed_bytes) {
+            target_payload_len = max_allowed_bytes;
+        }
+
+        int remaining_bytes = target_payload_len;
+        int max_chunk = 1400; // MTU-safe TCP payload size
+        uint32_t seq_offset = rand() % 1000000;
+
+        while (remaining_bytes > 0) {
+            int chunk_len = (remaining_bytes > max_chunk) ? max_chunk : remaining_bytes;
+
+            // Get pointer to current packet buffer in the batch
+            char *curr_pkt = packet_buffers[batch_idx];
+            struct ethhdr *curr_eth = (struct ethhdr *)curr_pkt;
+            struct iphdr *curr_iph = (struct iphdr *)(curr_pkt + sizeof(struct ethhdr));
+            struct tcphdr *curr_tcph = (struct tcphdr *)(curr_pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
+            char *curr_payload_ptr = curr_pkt + sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr);
+
+            // Copy layer 2 MAC addresses
+            switch (current_flow) {
+                case 0:
+                    memcpy(curr_eth->h_source, mac_u, 6);
+                    memcpy(curr_eth->h_dest, mac_w, 6);
+                    curr_iph->saddr = ip_u;
+                    curr_iph->daddr = ip_w;
+                    curr_tcph->source = htons(port_u);
+                    curr_tcph->dest = htons(PORT_HTTP);
+                    break;
+                case 1:
+                    memcpy(curr_eth->h_source, mac_w, 6);
+                    memcpy(curr_eth->h_dest, mac_u, 6);
+                    curr_iph->saddr = ip_w;
+                    curr_iph->daddr = ip_u;
+                    curr_tcph->source = htons(PORT_HTTP);
+                    curr_tcph->dest = htons(port_u);
+                    break;
+                case 2:
+                    memcpy(curr_eth->h_source, mac_w, 6);
+                    memcpy(curr_eth->h_dest, mac_a, 6);
+                    curr_iph->saddr = ip_w;
+                    curr_iph->daddr = ip_a;
+                    curr_tcph->source = htons(port_w_to_was);
+                    curr_tcph->dest = htons(PORT_WAS);
+                    break;
+                case 3:
+                    memcpy(curr_eth->h_source, mac_a, 6);
+                    memcpy(curr_eth->h_dest, mac_w, 6);
+                    curr_iph->saddr = ip_a;
+                    curr_iph->daddr = ip_w;
+                    curr_tcph->source = htons(PORT_WAS);
+                    curr_tcph->dest = htons(port_w_to_was);
+                    break;
+                case 4:
+                    memcpy(curr_eth->h_source, mac_a, 6);
+                    memcpy(curr_eth->h_dest, mac_d, 6);
+                    curr_iph->saddr = ip_a;
+                    curr_iph->daddr = ip_d;
+                    curr_tcph->source = htons(port_was_to_db);
+                    curr_tcph->dest = htons(PORT_DB);
+                    break;
+                case 5:
+                    memcpy(curr_eth->h_source, mac_d, 6);
+                    memcpy(curr_eth->h_dest, mac_a, 6);
+                    curr_iph->saddr = ip_d;
+                    curr_iph->daddr = ip_a;
+                    curr_tcph->source = htons(PORT_DB);
+                    curr_tcph->dest = htons(port_was_to_db);
+                    break;
+            }
+
+            // Fill payload
+            if (remaining_bytes == target_payload_len) {
+                int copy_len = (chunk_len > base_payload_len) ? base_payload_len : chunk_len;
+                memcpy(curr_payload_ptr, payload, copy_len);
+                if (chunk_len > copy_len) {
+                    memset(curr_payload_ptr + copy_len, 'A', chunk_len - copy_len);
+                }
+            } else {
+                memset(curr_payload_ptr, 'A', chunk_len);
+            }
+
+            curr_eth->h_proto = htons(ETH_P_IP);
+
+            curr_iph->version = 4;
+            curr_iph->ihl = 5;
+            curr_iph->tos = 0;
+            curr_iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + chunk_len);
+            curr_iph->id = htons(rand() % 65535);
+            curr_iph->frag_off = 0;
+            curr_iph->ttl = 64;
+            curr_iph->protocol = IPPROTO_TCP;
+            curr_iph->check = 0;
+            curr_iph->check = calculate_checksum((unsigned short *)curr_iph, sizeof(struct iphdr));
+
+            curr_tcph->seq = htonl(seq_offset);
+            curr_tcph->ack_seq = htonl(rand() % 1000000);
+            curr_tcph->doff = 5;
+            curr_tcph->fin = 0;
+            curr_tcph->syn = 0;
+            curr_tcph->rst = 0;
+            curr_tcph->psh = 1;
+            curr_tcph->ack = 1;
+            curr_tcph->urg = 0;
+            curr_tcph->window = htons(14600);
+            curr_tcph->check = 0;
+            curr_tcph->urg_ptr = 0;
+
+            curr_tcph->check = compute_tcp_checksum(curr_iph, curr_tcph, curr_payload_ptr, chunk_len);
+
+            int packet_size = sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + chunk_len;
+            iovecs[batch_idx].iov_len = packet_size;
+
+            batch_idx++;
+
+            // If batch is full, send it!
+            if (batch_idx == BATCH_SIZE) {
+                int sent = sendmmsg(sock, msgs, batch_idx, 0);
+                if (sent < 0) {
+                    perror("sendmmsg batch transmission failed");
+                    close(sock);
+                    if (config_file) free(config_file);
+                    return 1;
+                }
+                
+                // Accumulate statistics
+                for (int i = 0; i < sent; i++) {
+                    total_bytes += iovecs[i].iov_len;
+                }
+                total_sent += sent;
+                batch_idx = 0;
+            }
+
+            seq_offset += chunk_len;
+            remaining_bytes -= chunk_len;
+        }
+
         flow_counts[current_flow]++;
         step++;
 
@@ -485,6 +721,17 @@ int main(int argc, char *argv[]) {
             printf("[Stats] Total sent: %lu packets | Current Speed: %.2f PPS\n", total_sent, pps);
             last_report = now;
             last_sent_count = total_sent;
+        }
+    }
+
+    // Flush remaining packets in batch
+    if (batch_idx > 0) {
+        int sent = sendmmsg(sock, msgs, batch_idx, 0);
+        if (sent > 0) {
+            for (int i = 0; i < sent; i++) {
+                total_bytes += iovecs[i].iov_len;
+            }
+            total_sent += sent;
         }
     }
 
@@ -571,6 +818,6 @@ int main(int argc, char *argv[]) {
     write_ip_log(ip_log_path, ip_users, num_users, ip_webs, num_webs, ip_was, num_was, ip_dbs, num_dbs);
 
     close(sock);
-    free(if_name);
+    if (config_file) free(config_file);
     return 0;
 }
