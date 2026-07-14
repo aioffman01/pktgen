@@ -15,6 +15,18 @@ pps = 1000
 duration = 1
 
 
+[data]
+# 트랜잭션당 송출할 가상 데이터(Payload)의 최소 크기 (KB 단위, 소수점 지원)
+min_kb = 2.0
+
+# 트랜잭션당 송출할 가상 데이터(Payload)의 최대 크기 (KB 단위, 최대 10000.0 KB)
+# 1.4 KB(MTU 한계)를 넘어가면 내부적으로 패킷이 분할 전송(TCP Segmentation)됩니다.
+max_kb = 4.0
+
+# 멀티스레드 병렬 전송 옵션 (true = 3개 스레드 병렬 구동, false = 싱글스레드 순차 구동)
+use_thread = true
+
+
 [user]
 # 가상 User 노드들이 사용할 시작 IP 주소 / 서브넷 마스크
 ip = 10.0.1.1/24
@@ -41,15 +53,3 @@ count = 2
 ip = 10.0.4.1/24
 # 시뮬레이션할 가상 DB 서버 노드의 수
 count = 1
-
-
-[data]
-# 트랜잭션당 송출할 가상 데이터(Payload)의 최소 크기 (KB 단위, 소수점 지원)
-min_kb = 2.0
-
-# 트랜잭션당 송출할 가상 데이터(Payload)의 최대 크기 (KB 단위, 최대 10000.0 KB)
-# 1.4 KB(MTU 한계)를 넘어가면 내부적으로 패킷이 분할 전송(TCP Segmentation)됩니다.
-max_kb = 4.0
-
-# 멀티스레드 병렬 전송 옵션 (true = 3개 스레드 병렬 구동, false = 싱글스레드 순차 구동)
-use_thread = true
