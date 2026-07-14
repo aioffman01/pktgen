@@ -237,10 +237,16 @@ int parse_config(const char *filename,
     char current_section[64] = {0};
 
     while (fgets(line, sizeof(line), file)) {
+        // Strip inline comments
+        char *comment = strchr(line, ';');
+        if (comment) *comment = '\0';
+        comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+
         char *trimmed = trim_space(line);
         
-        // Skip comments and empty lines
-        if (trimmed[0] == ';' || trimmed[0] == '#' || trimmed[0] == '\0') {
+        // Skip empty lines
+        if (trimmed[0] == '\0') {
             continue;
         }
 
@@ -270,6 +276,14 @@ int parse_config(const char *filename,
                 } else if (strcmp(key, "duration") == 0) {
                     if (*duration_min == -1) {
                         *duration_min = atoi(val);
+                    }
+                } else if (strcmp(key, "use_thread") == 0) {
+                    if (*use_thread == -1) {
+                        if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+                            *use_thread = 1;
+                        } else {
+                            *use_thread = 0;
+                        }
                     }
                 }
             } else if (strcmp(current_section, "user") == 0) {
@@ -336,14 +350,6 @@ int parse_config(const char *filename,
                 } else if (strcmp(key, "max_kb") == 0) {
                     if (*max_kb < 0.0) {
                         *max_kb = atof(val);
-                    }
-                } else if (strcmp(key, "use_thread") == 0) {
-                    if (*use_thread == -1) {
-                        if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0) {
-                            *use_thread = 1;
-                        } else {
-                            *use_thread = 0;
-                        }
                     }
                 }
             }
